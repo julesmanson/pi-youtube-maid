@@ -1,0 +1,16 @@
+# Python bytecode cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor
+.vscode/
+
+# Windows OS cruft
+Thumbs.db
+desktop.ini
+
+# Personal runtime state - not source, and the worklist can contain real
+# YouTube subscription channel names (this repo is public).
+maid_settings.json
+unsubscribe_worklist.json
