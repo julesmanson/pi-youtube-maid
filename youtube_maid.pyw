@@ -1,5 +1,5 @@
 """
-YouTube Maid - mass-unsubscribe from YouTube channels, with a review step first.
+Pi YouTube Maid - mass-unsubscribe from YouTube channels, with a review step first.
 No API/OAuth - attaches to your real, already-logged-in Chrome via remote debugging
 (see launch_chrome_debug.bat) instead of launching a separate browser.
 
@@ -9,29 +9,29 @@ Setup:
 Workflow:
   1. Run launch_chrome_debug.bat (closes Chrome, reopens it debug-enabled,
      then opens this file automatically).
-  Both Generate and Start onboard themselves before doing anything else:
+  Generate and Start both onboard themselves before doing anything else:
   confirm this Chrome profile is logged into YouTube (aborts cleanly if not;
   proceeds with a warning if that can't be confirmed either way), open the
   configured URL, then click "All subscriptions" if that page offers one.
   2. Set "keep first N", click Generate. This scans every subscribed channel
-     and writes unsubscribe_worklist.json listing every channel NAME past
-     position N - the candidates for unsubscribing. Nothing is touched yet.
-  3. Open unsubscribe_worklist.json and delete any names you want to keep,
-     even though they're past position N. Save the file.
+     and fills the list on the right with every channel NAME past position
+     N - the candidates for unsubscribing. Nothing is touched yet.
+  3. Edit that list directly - one name per line, free-form text, Undo/Redo
+     supported. Save writes it to unsubscribe_worklist.txt; Reset clears it.
   4. Set the delay, then click Start. This only unsubscribes channels whose
-     name is still present in unsubscribe_worklist.json, matched against
-     the live page - not by position, so it's correct even if your
-     subscriptions changed between Generate and Start.
+     name is still present in that list, matched against the live page - not
+     by position, so it's correct even if your subscriptions changed between
+     Generate and Start. Each name is removed from the list live as its
+     channel is actually unsubscribed.
 
 Test Subscribe 10 (testing only, visually set apart from the above): skips
 the URL-opening/"All subscriptions" onboarding and goes straight to the
-YouTube home page, subscribing to up to 10 channels found there (full
-videos only, Shorts skipped by their own video-link URL; the only duplicate
-check is each channel's own live "already subscribed" state - it has no
-knowledge of unsubscribe_worklist.json or anything else). Once that step
-ends - 10 found, feed ran dry, or Stop - it hands off to a normal Generate
-run using the same URL/keep-first-N fields, so disposable test channels end
-up in the same worklist a real run would use.
+Harvest-from page (defaults to the YouTube home page, editable to any page),
+subscribing to up to 10 channels found there (full videos only, Shorts
+skipped by their own video-link URL; the only duplicate check is each
+channel's own live "already subscribed" state - it has no knowledge of the
+unsubscribe list or anything else). The names it actually subscribes to get
+appended to the list on the right - nothing else happens automatically.
 
 Delay before each (sec): an interruptible countdown shown before every
 unsubscribe click, so you have a real window to hit Stop before anything
@@ -58,15 +58,35 @@ import tkinter as tk
 from tkinter import ttk
 from playwright.sync_api import sync_playwright
 
+# Theme - one constant per part, edit freely. Applies uniformly everywhere
+# that part appears (skin covers the upper/middle/lower panels and the log,
+# alike - there's no separate "top section" color anymore).
+SKIN_BG = "#312a23"             # app surface background - every panel, top to bottom
+SKIN_TEXT = "#c5c9d2"           # text sitting on the skin (labels, log, counters)
+INPUT_FIELD_BG = "#617081"      # background inside editable areas (URL/N/delay/harvest entries)
+INPUT_TEXT = "#ffffff"          # color of what you type into a field
+BUTTON_BG = "#617081"           # button background, not pressed
+BUTTON_BG_PRESSED = "#abbcc9"   # button background, pressed
+BUTTON_TEXT = "#c5c9d2"         # text on buttons
+ATTRIBUTION_TEXT = "#9fafc5"    # "Developed by..." footer text
+STACK_BG = "#000000"            # background inside the stack display (current + up-next channels)
+STACK_TEXT = "#888888"          # the 3 up-next channel names in the stack display
+STACK_ACTIVE = "#00ff00"        # the currently staged (about to be unsubscribed) channel - always lime
+ERROR_TEXT = "#ff6b6b"          # not one of the named parts above - the stack display's stuck/error state, kept distinct since it's a status signal, not a skin color
+
+TEST_SUBSCRIBE_BATCH_SIZE = 10  # the target - how many channels to successfully subscribe to before stopping (the "10" in the button name), used as the loop's success condition
+TEST_SUBSCRIBE_SCROLL_GIVEUP = 10  # a timeout - how many consecutive scroll attempts that load zero new items to tolerate before giving up early (even if fewer than 10 were found), used as the stall-detection limit
+
 HERE = Path(__file__).resolve().parent
 SETTINGS_FILE = HERE / "maid_settings.json"
-WORKLIST_FILE = HERE / "unsubscribe_worklist.json"
+WORKLIST_FILE = HERE / "unsubscribe_worklist.txt"  # plain text, one channel name per line - no JSON
 
 DEFAULT_SETTINGS = {
-    "url": "https://www.youtube.com/feed/channels",
+    "url": "https://www.youtube.com/feed/subscriptions",
     "keep_first_n": 24,
     "cdp_url": "http://localhost:9222",
-    "delay_seconds": 5.0
+    "delay_seconds": 5.0,
+    "harvest_url": "https://www.youtube.com"
 }
 
 YOUTUBE_HOME_URL = "https://www.youtube.com"
@@ -82,15 +102,12 @@ CONFIRM_SELECTOR = (
     "yt-confirm-dialog-renderer button:has-text('Unsubscribe')"
 )
 
-QUEUE_PREVIEW_COUNT = 3  # "up next" rows shown below the current channel
 QUEUE_LOOKAHEAD_SCAN_CAP = 60  # rows to scan forward for preview names before giving up
 
 HOME_ITEM_SELECTOR = "ytd-rich-item-renderer"
 HOME_VIDEO_LINK_SELECTOR = "a#thumbnail"
 HOME_CHANNEL_LINK_SELECTOR = "ytd-channel-name a, #channel-name a"
 CHANNEL_SUBSCRIBE_BUTTON_SELECTOR = "ytd-subscribe-button-renderer button, #subscribe-button button"
-TEST_SUBSCRIBE_BATCH_SIZE = 10
-TEST_SUBSCRIBE_SCROLL_GIVEUP = 10
 
 
 def load_settings():
@@ -118,25 +135,49 @@ def load_settings():
     return settings
 
 
-def save_last_used(url, keep_first_n, cdp_url, delay_seconds):
+def save_last_used(url, keep_first_n, cdp_url, delay_seconds, harvest_url):
     SETTINGS_FILE.write_text(json.dumps(
         {
             "url": url,
             "keep_first_n": keep_first_n,
             "cdp_url": cdp_url,
-            "delay_seconds": delay_seconds
+            "delay_seconds": delay_seconds,
+            "harvest_url": harvest_url
         },
         indent=2
     ))
 
 
+def load_worklist_text():
+    if WORKLIST_FILE.exists():
+        try:
+            return WORKLIST_FILE.read_text()
+        except Exception:
+            return ""
+    return ""
+
+
 class YouTubeMaid:
     def __init__(self, root, settings):
         self.root = root
-        root.title("YouTube Maid")
-        root.geometry("560x580")
-        root.minsize(500, 460)
+        root.title("Pi YouTube Maid")
+        root.geometry("900x580")
+        root.minsize(700, 460)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        root.configure(background=SKIN_BG)
+        style = ttk.Style(root)
+        style.theme_use("clam")  # clam actually honors background/foreground overrides on Windows, unlike vista/winnative
+        style.configure(".", background=SKIN_BG, foreground=SKIN_TEXT)
+        style.configure("TFrame", background=SKIN_BG)
+        style.configure("TLabel", background=SKIN_BG, foreground=SKIN_TEXT)
+        style.configure("TButton", background=BUTTON_BG, foreground=BUTTON_TEXT)
+        style.map("TButton", background=[("pressed", BUTTON_BG_PRESSED), ("active", BUTTON_BG_PRESSED)],
+                  foreground=[])
+        style.configure("TEntry", fieldbackground=INPUT_FIELD_BG, foreground=INPUT_TEXT, insertcolor=INPUT_TEXT)
+        style.configure("TSpinbox", fieldbackground=INPUT_FIELD_BG, foreground=INPUT_TEXT,
+                         insertcolor=INPUT_TEXT, arrowcolor=SKIN_TEXT)
+        style.configure("TScrollbar", background=INPUT_FIELD_BG, troughcolor=SKIN_BG, arrowcolor=SKIN_TEXT)
 
         self.stop_event = threading.Event()
         self.skip_event = threading.Event()
@@ -144,101 +185,171 @@ class YouTubeMaid:
         self.worker_thread = None
         self.running = False
 
-        form = ttk.Frame(root, padding=12)
-        form.pack(fill="x")
-
-        ttk.Label(form, text="Channels page URL:").grid(row=0, column=0, sticky="w")
-        self.url_var = tk.StringVar(value=settings["url"])
-        ttk.Entry(form, textvariable=self.url_var, width=42).grid(row=0, column=1, sticky="we", pady=4)
-
-        ttk.Label(form, text="Keep first N from top:").grid(row=1, column=0, sticky="w")
-        self.start_at_var = tk.IntVar(value=settings["keep_first_n"])
-        self.start_at_spin = ttk.Spinbox(form, from_=0, to=100000, textvariable=self.start_at_var, width=10)
-        self.start_at_spin.grid(row=1, column=1, sticky="w", pady=4)
-
-        ttk.Label(form, text="Delay before each (sec):").grid(row=2, column=0, sticky="w")
-        self.delay_var = tk.DoubleVar(value=settings["delay_seconds"])
-        self.delay_spin = ttk.Spinbox(form, from_=0, to=300, increment=0.5, format="%.1f",
-                                       textvariable=self.delay_var, width=10)
-        self.delay_spin.grid(row=2, column=1, sticky="w", pady=4)
-
-        form.columnconfigure(1, weight=1)
-
-        ttk.Label(root, text=f"Generate writes {WORKLIST_FILE.name} - edit it to remove any names you want to keep, then click Start.",
-                  wraplength=520, padding=(12, 0)).pack(fill="x")
-
-        btn_frame = ttk.Frame(root, padding=(12, 8))
-        btn_frame.pack(fill="x")
-        self.generate_btn = ttk.Button(btn_frame, text="Generate", command=self.on_generate)
-        self.generate_btn.pack(side="left", padx=4)
-        self.start_btn = ttk.Button(btn_frame, text="Start", command=self.on_start)
-        self.start_btn.pack(side="left", padx=4)
-        self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self.on_stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=4)
-        self.skip_btn = ttk.Button(btn_frame, text="Skip", command=self.on_skip, state="disabled")
-        self.skip_btn.pack(side="left", padx=4)
-        self.pause_btn = ttk.Button(btn_frame, text="Pause", command=self.on_pause_toggle, state="disabled")
-        self.pause_btn.pack(side="left", padx=4)
-
-        # Separate row, visually set apart - a testing utility, not part of the
-        # main Generate/Start workflow above it.
-        test_frame = ttk.Frame(root, padding=(12, 0, 12, 8))
-        test_frame.pack(fill="x")
-        ttk.Label(test_frame, text="Testing:", foreground="#6b7280").pack(side="left", padx=(0, 6))
-        self.test_subscribe_btn = ttk.Button(test_frame, text="Test Subscribe 10", command=self.on_test_subscribe)
-        self.test_subscribe_btn.pack(side="left")
-        ttk.Label(test_frame, text="subscribes to up to 10 new channels from the YouTube home page "
-                  "(full videos only, skips Shorts and already-subscribed channels), then runs a normal "
-                  "Generate scan - lets you test Start against disposable channels.",
-                  foreground="#6b7280", wraplength=380).pack(side="left", padx=(8, 0))
-
-        # Queue preview: row 0 is the current/in-progress channel (green), rows
-        # 1..QUEUE_PREVIEW_COUNT are upcoming worklist matches, muted. The stack
-        # pushes up as each one finishes - row 1 becomes row 0, and so on.
-        queue_frame = ttk.Frame(root, padding=(12, 4))
-        queue_frame.pack(fill="x")
-
-        self.progress_var = tk.StringVar(value="")
-        ttk.Label(queue_frame, textvariable=self.progress_var, font=("", 9)).pack(anchor="w")
-
-        self.countdown_var = tk.StringVar(value="")
-        ttk.Label(queue_frame, textvariable=self.countdown_var, font=("", 16, "bold")).pack(anchor="w")
-
-        queue_box = tk.Frame(queue_frame, relief="solid", borderwidth=1, background="#ffffff")
-        queue_box.pack(fill="x", pady=(2, 0))
-
-        self.queue_labels = []
-        for i in range(1 + QUEUE_PREVIEW_COUNT):
-            lbl = tk.Label(queue_box, text="(idle)" if i == 0 else "", anchor="w",
-                            padx=8, pady=2, background="#ffffff",
-                            font=("", 9, "bold" if i == 0 else "normal"),
-                            foreground="#1a7f37" if i == 0 else "#6b7280")
-            lbl.pack(fill="x")
-            self.queue_labels.append(lbl)
-
         footer = ttk.Frame(root, padding=(12, 2))
         footer.pack(side="bottom", fill="x")
         ttk.Label(footer, text="Developed by Jules Manson and Claude Sonnet 5.",
-                  font=("", 8), foreground="#6b7280").pack(anchor="center")
+                  font=("", 8), foreground=ATTRIBUTION_TEXT).pack(anchor="center")
 
-        log_frame = ttk.Frame(root, padding=12)
-        log_frame.pack(fill="both", expand=True)
-        self.log_text = tk.Text(log_frame, height=16, state="disabled", wrap="word")
-        self.log_text.pack(fill="both", expand=True, side="left")
-        scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
-        scrollbar.pack(side="right", fill="y")
-        self.log_text.config(yscrollcommand=scrollbar.set)
+        columns_frame = ttk.Frame(root)
+        columns_frame.pack(fill="both", expand=True)
 
-        self.log("Ready. Set the number, click Generate, review the file it writes, then click Start.")
+        left_frame = ttk.Frame(columns_frame)
+        left_frame.pack(side="left", fill="y")
+
+        right_frame = ttk.Frame(columns_frame, padding=(4, 12, 12, 12))
+        right_frame.pack(side="left", fill="both", expand=True)
+
+        # Row 1: the stack display. One continuous STACK_BG fill, no skin-colored
+        # gap anywhere inside it - progress/countdown/queue rows all share it.
+        # This is a real stack: row 0 (top) is the active/current channel,
+        # every row below is "up next," pushing up as each one finishes - and
+        # the stack holds as many rows as actually fit the available height,
+        # not a fixed count. It grows/shrinks live as the window is resized.
+        queue_frame = ttk.Frame(left_frame, padding=(12, 8, 12, 10))
+        queue_frame.pack(fill="both", expand=True)
+
+        display_box = tk.Frame(queue_frame, background=STACK_BG)
+        display_box.pack(fill="both", expand=True)
+
+        self.progress_var = tk.StringVar(value="")
+        tk.Label(display_box, textvariable=self.progress_var, font=("", 9), anchor="w",
+                 background=STACK_BG, foreground=SKIN_TEXT).pack(fill="x", padx=8, pady=(6, 0))
+
+        self.countdown_var = tk.StringVar(value="")
+        tk.Label(display_box, textvariable=self.countdown_var, font=("", 16, "bold"), anchor="w",
+                 background=STACK_BG, foreground=SKIN_TEXT).pack(fill="x", padx=8)
+
+        self.queue_box = tk.Frame(display_box, background=STACK_BG)
+        self.queue_box.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        # Without this, queue_box's own requested size ratchets up with its
+        # children and never shrinks back down after the window does -
+        # verified: without it, growing to many rows then shrinking back left
+        # it stuck oversized (391px/17 rows instead of returning to 162px/7).
+        self.queue_box.pack_propagate(False)
+
+        self.queue_labels = []
+        self._queue_row_height = None
+        self._add_queue_row()  # row 0 (current) always exists, even before any resize event fires
+        self.queue_box.bind("<Configure>", self._on_queue_box_resize)
+
+        # Row 2: the 4 run-control buttons together, in this exact order,
+        # centered to match the full-width display above them. Generate
+        # lives in the top-right of the right panel instead - it fills the
+        # list there, so it sits next to what it fills.
+        btn_frame = ttk.Frame(left_frame, padding=(12, 0, 12, 8))
+        btn_frame.pack(fill="x")
+        btn_group = ttk.Frame(btn_frame)
+        btn_group.pack(anchor="center")
+        self.start_btn = ttk.Button(btn_group, text="Start", command=self.on_start)
+        self.start_btn.pack(side="left", padx=4)
+        self.stop_btn = ttk.Button(btn_group, text="Stop", command=self.on_stop, state="disabled")
+        self.stop_btn.pack(side="left", padx=4)
+        self.pause_btn = ttk.Button(btn_group, text="Pause", command=self.on_pause_toggle, state="disabled")
+        self.pause_btn.pack(side="left", padx=4)
+        self.skip_btn = ttk.Button(btn_group, text="Skip", command=self.on_skip, state="disabled")
+        self.skip_btn.pack(side="left", padx=4)
+
+        # Everything else - unchanged from before, just now sitting below the two rows above.
+        form = ttk.Frame(left_frame, padding=12)
+        form.pack(fill="x")
+
+        ttk.Label(form, text="Channels page URL").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.url_var = tk.StringVar(value=settings["url"])
+        ttk.Entry(form, textvariable=self.url_var, width=42).grid(row=0, column=1, sticky="we", pady=4)
+
+        form.columnconfigure(1, weight=1)
+
+        controls_frame = ttk.Frame(left_frame, padding=(12, 0, 12, 4))
+        controls_frame.pack(fill="x")
+        ttk.Label(controls_frame, text="Keep first N").pack(side="left")
+        self.start_at_var = tk.IntVar(value=settings["keep_first_n"])
+        self.start_at_spin = ttk.Spinbox(controls_frame, from_=0, to=100000, textvariable=self.start_at_var, width=8)
+        self.start_at_spin.pack(side="left", padx=(8, 12))
+        ttk.Label(controls_frame, text="Delay (sec)").pack(side="left")
+        self.delay_var = tk.DoubleVar(value=settings["delay_seconds"])
+        self.delay_spin = ttk.Spinbox(controls_frame, from_=0, to=300, increment=0.5, format="%.1f",
+                                       textvariable=self.delay_var, width=6)
+        self.delay_spin.pack(side="left", padx=(8, 12))
+
+        ttk.Label(left_frame, text=f"Generate fills the list on the right - edit it there, then click Start.",
+                  wraplength=440, padding=(12, 0)).pack(fill="x")
+
+        # Separate row, visually set apart - a testing utility, not part of the
+        # main Generate/Start workflow above it.
+        test_frame = ttk.Frame(left_frame, padding=(12, 8, 12, 8))
+        test_frame.pack(fill="x")
+        ttk.Label(test_frame, text="Testing").pack(side="left", padx=(0, 8))
+        self.test_subscribe_btn = ttk.Button(test_frame, text="Test Subscribe 10", command=self.on_test_subscribe)
+        self.test_subscribe_btn.pack(side="left")
+        ttk.Label(test_frame, text="subscribes to up to 10 new channels from the page below "
+                  "(full videos only, skips Shorts and already-subscribed channels), then appends "
+                  "those names to the list on the right.",
+                  wraplength=320).pack(side="left", padx=(8, 0))
+
+        harvest_frame = ttk.Frame(left_frame, padding=(12, 0, 12, 8))
+        harvest_frame.pack(fill="x")
+        ttk.Label(harvest_frame, text="Harvest from").pack(side="left", padx=(0, 8))
+        self.harvest_url_var = tk.StringVar(value=settings["harvest_url"])
+        self.harvest_url_entry = ttk.Entry(harvest_frame, textvariable=self.harvest_url_var, width=42)
+        self.harvest_url_entry.pack(side="left", fill="x", expand=True)
+
+        # Right column: the worklist itself - plain text, one channel name per
+        # line, directly editable. This IS the worklist; WORKLIST_FILE is only
+        # touched by Save (writing it out) and startup (reading it back in).
+        worklist_btn_frame = ttk.Frame(right_frame, padding=(0, 0, 0, 6))
+        worklist_btn_frame.pack(fill="x")
+        self.worklist_save_btn = ttk.Button(worklist_btn_frame, text="Save", command=self.on_worklist_save)
+        self.worklist_save_btn.pack(side="left", padx=(0, 4))
+        self.worklist_undo_btn = ttk.Button(worklist_btn_frame, text="Undo", command=self.on_worklist_undo)
+        self.worklist_undo_btn.pack(side="left", padx=4)
+        self.worklist_redo_btn = ttk.Button(worklist_btn_frame, text="Redo", command=self.on_worklist_redo)
+        self.worklist_redo_btn.pack(side="left", padx=4)
+        self.worklist_reset_btn = ttk.Button(worklist_btn_frame, text="Reset", command=self.on_worklist_reset)
+        self.worklist_reset_btn.pack(side="left", padx=4)
+        self.generate_btn = ttk.Button(worklist_btn_frame, text="Generate", command=self.on_generate)
+        self.generate_btn.pack(side="right", padx=(4, 0))
+
+        worklist_text_frame = ttk.Frame(right_frame)
+        worklist_text_frame.pack(fill="both", expand=True)
+        self.worklist_text = tk.Text(worklist_text_frame, wrap="none", undo=True,
+                                      background=INPUT_FIELD_BG, foreground=INPUT_TEXT,
+                                      insertbackground=INPUT_TEXT)
+        self.worklist_text.pack(side="left", fill="both", expand=True)
+        worklist_scrollbar = ttk.Scrollbar(worklist_text_frame, command=self.worklist_text.yview)
+        worklist_scrollbar.pack(side="right", fill="y")
+        self.worklist_text.config(yscrollcommand=worklist_scrollbar.set)
+
+        existing_worklist = load_worklist_text()
+        if existing_worklist:
+            self.worklist_text.insert("1.0", existing_worklist)
+        self.worklist_text.edit_reset()  # the initial load isn't itself an undoable edit
+
+        self.log("Ready. Set the number, click Generate, review the list on the right, then click Start.")
 
     def log(self, message):
-        self.root.after(0, lambda: self._append_log(message))
+        print(message)
 
-    def _append_log(self, message):
-        self.log_text.config(state="normal")
-        self.log_text.insert("end", message + "\n")
-        self.log_text.see("end")
-        self.log_text.config(state="disabled")
+    def _add_queue_row(self):
+        i = len(self.queue_labels)
+        lbl = tk.Label(self.queue_box, text="(idle)" if i == 0 else "", anchor="w",
+                        padx=8, pady=2, background=STACK_BG,
+                        font=("", 9, "bold" if i == 0 else "normal"),
+                        foreground=STACK_ACTIVE if i == 0 else STACK_TEXT)
+        lbl.pack(fill="x")
+        self.queue_labels.append(lbl)
+
+    def _on_queue_box_resize(self, event):
+        # Measures the first row's real rendered height once, then fits as
+        # many rows as the box's current height allows - row 0 (current) is
+        # never removed even if space is tight.
+        if self._queue_row_height is None:
+            self.queue_box.update_idletasks()
+            self._queue_row_height = max(self.queue_labels[0].winfo_reqheight(), 1)
+        desired_count = max(1, event.height // self._queue_row_height)
+        while len(self.queue_labels) < desired_count:
+            self._add_queue_row()
+        while len(self.queue_labels) > desired_count and len(self.queue_labels) > 1:
+            self.queue_labels.pop().destroy()
 
     def set_progress(self, processed, remaining_count, total):
         text = f"{processed} unsubscribed - {remaining_count} of {total} remaining"
@@ -256,16 +367,42 @@ class YouTubeMaid:
             else:
                 lbl.config(text="(idle)" if i == 0 else "")
             if i == 0:
-                lbl.config(foreground="#1a7f37")  # green - also clears a prior error's red
+                lbl.config(foreground=STACK_ACTIVE)  # also clears a prior error's red
 
     def set_error(self, message, suggestion):
         self.root.after(0, lambda: self._render_error(f"{message} - {suggestion}"))
 
     def _render_error(self, text):
         self.countdown_var.set("")
-        self.queue_labels[0].config(text=text, foreground="#b91c1c")  # red
+        self.queue_labels[0].config(text=text, foreground=ERROR_TEXT)
         for lbl in self.queue_labels[1:]:
             lbl.config(text="")
+
+    def worklist_names(self):
+        # Called from the worker thread - reading a Tk widget's current text
+        # is safe without root.after, only mutating it needs marshaling.
+        text = self.worklist_text.get("1.0", "end")
+        return {line.strip() for line in text.splitlines() if line.strip()}
+
+    def set_worklist(self, names):
+        self.root.after(0, lambda: self._replace_worklist_text("\n".join(names)))
+
+    def append_worklist(self, names):
+        def _do():
+            current = self.worklist_text.get("1.0", "end").strip()
+            combined = (current + "\n" + "\n".join(names)) if current else "\n".join(names)
+            self._replace_worklist_text(combined)
+        self.root.after(0, _do)
+
+    def remove_worklist_line(self, name):
+        def _do():
+            lines = [l for l in self.worklist_text.get("1.0", "end").splitlines() if l.strip() != name]
+            self._replace_worklist_text("\n".join(lines))
+        self.root.after(0, _do)
+
+    def _replace_worklist_text(self, text):
+        self.worklist_text.delete("1.0", "end")
+        self.worklist_text.insert("1.0", text)
 
     @staticmethod
     def _format_seconds(seconds):
@@ -308,11 +445,14 @@ class YouTubeMaid:
     def _lookahead_upcoming(self, rows, position, remaining, exclude):
         # Read-only preview scan - never clicks anything, just inner_text() on
         # rows past the current one, looking for the next worklist matches.
+        # However many "up next" slots the stack display currently has (it
+        # resizes live), minus 1 for the current/active row at the top.
+        upcoming_slots = max(0, len(self.queue_labels) - 1)
         names = []
         count = rows.count()
         end = min(count, position + 1 + QUEUE_LOOKAHEAD_SCAN_CAP)
         i = position + 1
-        while i < end and len(names) < QUEUE_PREVIEW_COUNT:
+        while i < end and len(names) < upcoming_slots:
             try:
                 name = rows.nth(i).locator(NAME_SELECTOR).first.inner_text(timeout=800).strip()
             except Exception:
@@ -390,7 +530,11 @@ class YouTubeMaid:
         except (ValueError, tk.TclError):
             self.log("Delay must be a real number, 0 or higher.")
             return None
-        return url, start_at, delay
+        harvest_url = self.harvest_url_var.get().strip()
+        if not harvest_url:
+            self.log("Harvest-from URL is empty.")
+            return None
+        return url, start_at, delay, harvest_url
 
     def _set_running_ui(self, running, unsubscribing=False):
         state = "disabled" if running else "normal"
@@ -399,11 +543,19 @@ class YouTubeMaid:
         self.test_subscribe_btn.config(state=state)
         self.start_at_spin.config(state=state)
         self.delay_spin.config(state=state)
+        self.harvest_url_entry.config(state=state)
         self.stop_btn.config(state="normal" if running else "disabled")
         # Skip/Pause only mean anything mid-unsubscribe - Generate/Test Subscribe have no per-channel action to skip or pause.
         skip_pause_state = "normal" if (running and unsubscribing) else "disabled"
         self.skip_btn.config(state=skip_pause_state)
         self.pause_btn.config(state=skip_pause_state)
+        # The worklist itself is locked while running - a worker thread may be
+        # reading/mutating it (removing lines as it processes them).
+        self.worklist_text.config(state=state)
+        self.worklist_save_btn.config(state=state)
+        self.worklist_undo_btn.config(state=state)
+        self.worklist_redo_btn.config(state=state)
+        self.worklist_reset_btn.config(state=state)
 
     def on_generate(self):
         if self.running:
@@ -411,12 +563,12 @@ class YouTubeMaid:
         form = self._read_form()
         if form is None:
             return
-        url, start_at, delay = form
+        url, start_at, delay, harvest_url = form
 
         self.running = True
         self.stop_event.clear()
         self._set_running_ui(True)
-        save_last_used(url, start_at, DEFAULT_SETTINGS["cdp_url"], delay)
+        save_last_used(url, start_at, DEFAULT_SETTINGS["cdp_url"], delay, harvest_url)
 
         self.worker_thread = threading.Thread(
             target=self.run_generate, args=(url, start_at, DEFAULT_SETTINGS["cdp_url"]), daemon=True
@@ -429,40 +581,30 @@ class YouTubeMaid:
         form = self._read_form()
         if form is None:
             return
-        url, start_at, delay = form
+        url, start_at, delay, harvest_url = form
 
         self.running = True
         self.stop_event.clear()
         self._set_running_ui(True)
-        save_last_used(url, start_at, DEFAULT_SETTINGS["cdp_url"], delay)
+        save_last_used(url, start_at, DEFAULT_SETTINGS["cdp_url"], delay, harvest_url)
 
         self.worker_thread = threading.Thread(
-            target=self.run_test_subscribe, args=(url, start_at, DEFAULT_SETTINGS["cdp_url"]), daemon=True
+            target=self.run_test_subscribe, args=(DEFAULT_SETTINGS["cdp_url"], harvest_url), daemon=True
         )
         self.worker_thread.start()
 
     def on_start(self):
         if self.running:
             return
-        if not WORKLIST_FILE.exists():
-            self.log(f"{WORKLIST_FILE.name} doesn't exist yet - click Generate first, review it, then Start.")
-            return
-        try:
-            worklist = json.loads(WORKLIST_FILE.read_text())
-            if not isinstance(worklist, list):
-                raise ValueError
-        except Exception:
-            self.log(f"{WORKLIST_FILE.name} isn't valid JSON (should be a list of names) - fix or regenerate it.")
-            return
-        names = {str(n).strip() for n in worklist if str(n).strip()}
+        names = self.worklist_names()
         if not names:
-            self.log(f"{WORKLIST_FILE.name} is empty - nothing to unsubscribe. Generate again if that's wrong.")
+            self.log("The list on the right is empty - nothing to unsubscribe.")
             return
 
         form = self._read_form()
         if form is None:
             return
-        url, _start_at, delay = form
+        url, _start_at, delay, harvest_url = form
 
         self.running = True
         self.stop_event.clear()
@@ -470,7 +612,7 @@ class YouTubeMaid:
         self.pause_event.clear()
         self.pause_btn.config(text="Pause")
         self._set_running_ui(True, unsubscribing=True)
-        save_last_used(url, _start_at, DEFAULT_SETTINGS["cdp_url"], delay)
+        save_last_used(url, _start_at, DEFAULT_SETTINGS["cdp_url"], delay, harvest_url)
 
         self.worker_thread = threading.Thread(
             target=self.run_unsubscribe, args=(url, names, DEFAULT_SETTINGS["cdp_url"], delay), daemon=True
@@ -498,6 +640,33 @@ class YouTubeMaid:
             self.pause_event.set()
             self.pause_btn.config(text="Resume")
             self.log("Paused - will hold before the next action.")
+
+    def on_worklist_save(self):
+        if self.running:
+            return
+        WORKLIST_FILE.write_text(self.worklist_text.get("1.0", "end"))
+        self.log(f"Saved {WORKLIST_FILE.name}.")
+
+    def on_worklist_undo(self):
+        if self.running:
+            return
+        try:
+            self.worklist_text.edit_undo()
+        except tk.TclError:
+            pass  # nothing left to undo
+
+    def on_worklist_redo(self):
+        if self.running:
+            return
+        try:
+            self.worklist_text.edit_redo()
+        except tk.TclError:
+            pass  # nothing left to redo
+
+    def on_worklist_reset(self):
+        if self.running:
+            return
+        self.worklist_text.delete("1.0", "end")
 
     def on_finished(self):
         self.running = False
@@ -545,7 +714,7 @@ class YouTubeMaid:
                     page.wait_for_timeout(1000)
 
                 if self.stop_event.is_set():
-                    self.log("Stopped before the scan finished - no file written.")
+                    self.log("Stopped before the scan finished - list not updated.")
                     page.close()
                     return
 
@@ -565,9 +734,9 @@ class YouTubeMaid:
                         name = ""
                     names.append(name if name else f"(unnamed channel #{i + 1})")
 
-                WORKLIST_FILE.write_text(json.dumps(names, indent=2, ensure_ascii=False))
+                self.set_worklist(names)
                 self.log(f"Found {total} channels total, {len(names)} past position {start_at}.")
-                self.log(f"Wrote {WORKLIST_FILE.name}. Review it, delete any names you want to keep, then click Start.")
+                self.log("Filled the list on the right. Review/edit it, then click Start.")
                 page.close()
 
         except Exception as e:
@@ -575,23 +744,26 @@ class YouTubeMaid:
         finally:
             self.root.after(0, self.on_finished)
 
-    def _subscribe_up_to_10_from_home(self, page, context):
+    def _subscribe_up_to_10_from_page(self, page, context, harvest_url):
         # Read-then-decide per item: only a full-video item (never Shorts, judged
         # by its own thumbnail link href rather than a fragile class/attribute
         # name) gets a real subscribe attempt. The only duplicate check is each
         # channel's own live "already subscribed" state - this method has no
-        # knowledge of unsubscribe_worklist.json or anything outside this scan;
+        # knowledge of the unsubscribe worklist or anything outside this scan;
         # seen_names below is just this-run dedup (the same channel can appear
-        # more than once in the feed) and is never seeded from any file.
-        page.goto(YOUTUBE_HOME_URL)
+        # more than once in the feed) and is never seeded from the worklist.
+        # harvest_url defaults to the YouTube home page but can be any page
+        # that renders ytd-rich-item-renderer video tiles (search results,
+        # a trending page, etc.).
+        page.goto(harvest_url)
         page.wait_for_timeout(1500)
 
         seen_names = set()
-        subscribed = 0
+        subscribed_names = []
         index = 0
         scroll_tries = 0
 
-        while subscribed < TEST_SUBSCRIBE_BATCH_SIZE and not self.stop_event.is_set():
+        while len(subscribed_names) < TEST_SUBSCRIBE_BATCH_SIZE and not self.stop_event.is_set():
             items = page.locator(HOME_ITEM_SELECTOR)
             count = items.count()
 
@@ -639,21 +811,17 @@ class YouTubeMaid:
                 else:
                     btn.click()
                     chan_page.wait_for_timeout(1000)
-                    subscribed += 1
-                    self.log(f"Subscribed #{subscribed}: {channel_name}")
+                    subscribed_names.append(channel_name)
+                    self.log(f"Subscribed #{len(subscribed_names)}: {channel_name}")
             except Exception as e:
                 self.log(f"Couldn't process '{channel_name}': {e}")
             finally:
                 chan_page.close()
 
-        self.log(f"Test Subscribe 10: {subscribed} new subscription(s) this run.")
-        return subscribed
+        self.log(f"Test Subscribe 10: {len(subscribed_names)} new subscription(s) this run.")
+        return subscribed_names
 
-    def run_test_subscribe(self, url, start_at, cdp_url):
-        # Only the subscribe-10-from-home step is unique to this button - once
-        # that's done (or skipped/stopped), it hands off to a plain run_generate
-        # for everything else, including that method's own on_finished dispatch.
-        completed = False
+    def run_test_subscribe(self, cdp_url, harvest_url):
         try:
             with sync_playwright() as p:
                 try:
@@ -672,23 +840,17 @@ class YouTubeMaid:
                     page.close()
                     return
 
-                self._subscribe_up_to_10_from_home(page, context)
+                subscribed_names = self._subscribe_up_to_10_from_page(page, context, harvest_url)
                 page.close()
 
-                if self.stop_event.is_set():
-                    self.log("Stopped before the normal Generate scan started.")
-                else:
-                    self.log("Continuing with a normal Generate scan...")
-                    completed = True
+                if subscribed_names:
+                    self.append_worklist(subscribed_names)
+                    self.log(f"Appended {len(subscribed_names)} name(s) to the list on the right.")
 
         except Exception as e:
             self.log(f"Fatal error: {e}")
         finally:
-            if not completed:
-                self.root.after(0, self.on_finished)
-
-        if completed:
-            self.run_generate(url, start_at, cdp_url)
+            self.root.after(0, self.on_finished)
 
     def run_unsubscribe(self, url, worklist_names, cdp_url, delay_seconds):
         try:
@@ -818,6 +980,7 @@ class YouTubeMaid:
                                 confirm.click()
                                 processed += 1
                                 remaining.discard(channel_name)
+                                self.remove_worklist_line(channel_name)
                                 self.log(f"Unsubscribed #{processed}: {channel_name}")
                                 self.set_progress(processed, len(remaining), total)
                                 # position NOT advanced - this row is gone, the next channel shifted into it

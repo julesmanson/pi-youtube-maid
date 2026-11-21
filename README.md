@@ -26,7 +26,7 @@ Runs automatically at the start of Generate, Start, and Test Subscribe 10.
 
 A separate button, visually set apart - exists purely to create disposable test subscriptions, not part of normal use.
 
-1. After the login check, goes straight to the YouTube home page (not the configured URL), looking for up to 10 channels to subscribe to.
+1. After the login check, goes straight to the **Harvest from** URL (its own field, below the button - defaults to the YouTube home page, editable to any page with video tiles), looking for up to 10 channels to subscribe to.
 2. Shorts skipped outright, judged by each item's own video-link URL - only full-video channels are candidates.
 3. Only duplicate check: the channel's own live "Subscribed" state. No knowledge of `unsubscribe_worklist.json` - a channel already in that file gets checked and subscribed like any other. (Same channel appearing twice in the feed is only opened once, since re-checking it is just wasted work.)
 4. Feed runs dry before reaching 10 (after a few scroll retries): stops with whatever it found.
@@ -46,7 +46,7 @@ A separate button, visually set apart - exists purely to create disposable test 
 
 ## Settings
 
-- `maid_settings.json` - remembers last-used URL / keep_first_n / delay. Auto-created, gitignored.
+- `maid_settings.json` - remembers last-used URL / keep_first_n / delay / harvest URL. Auto-created, gitignored.
 - `cdp_url` - Chrome debug port, only in that file - only matters if 9222 is ever unavailable.
 
 ## Notes
